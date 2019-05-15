@@ -1,7 +1,4 @@
-class AttentionMechanism ========> 
 
-
-```
 def _prepare_memory(memory, memory_sequence_length, check_inner_dims_defined):
   """Convert to tensor and possibly mask `memory`.
   Args:
@@ -60,9 +57,9 @@ def _prepare_memory(memory, memory_sequence_length, check_inner_dims_defined):
     else:
       return m
 return nest.map_structure(lambda m: _maybe_mask(m, seq_len_mask), memory)
-```
 
-```
+
+
 def _maybe_mask_score(score, memory_sequence_length, score_mask_value):
   # 如果没有指定句子长度，直接返回得分
   if memory_sequence_length is None:
@@ -274,4 +271,3 @@ def _luong_score(query, keys, scale):
         initializer=init_ops.ones_initializer, shape=())
     score = g * score
 return score
-```
