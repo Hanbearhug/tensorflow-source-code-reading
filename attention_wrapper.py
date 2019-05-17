@@ -633,3 +633,267 @@ def _monotonic_probability_fn(score, previous_alignments, sigmoid_noise, mode,
     p_choose_i = math_ops.sigmoid(score)
   # Convert from choosing probabilities to attention distribution
 return monotonic_attention(p_choose_i, previous_alignments, mode)
+
+class _BaseMonotonicAttentionMechanism(_BaseAttentionMechanism):
+  """Base attention mechanism for monotonic attention.
+  Simply overrides the initial_alignments function to provide a dirac
+  distribution, which is needed in order for the monotonic attention
+  distributions to have the correct behavior.
+  """
+
+  def initial_alignments(self, batch_size, dtype):
+    """Creates the initial alignment values for the monotonic attentions.
+    Initializes to dirac distributions, i.e. [1, 0, 0, ...memory length..., 0]
+    for all entries in the batch.
+    Args:
+      batch_size: `int32` scalar, the batch_size.
+      dtype: The `dtype`.
+    Returns:
+      A `dtype` tensor shaped `[batch_size, alignments_size]`
+      (`alignments_size` is the values' `max_time`).
+    """
+    # 看上去像是初始化了一个单位矩阵，表示11对应关系
+    max_time = self._alignments_size
+    return array_ops.one_hot(
+        array_ops.zeros((batch_size,), dtype=dtypes.int32), max_time,
+dtype=dtype)
+  
+class BahdanauMonotonicAttention(_BaseMonotonicAttentionMechanism):
+  """Monotonic attention mechanism with Bahadanau-style energy function.
+  This type of attention enforces a monotonic constraint on the attention
+  distributions; that is once the model attends to a given point in the memory
+  it can't attend to any prior points at subsequence output timesteps.  It
+  achieves this by using the _monotonic_probability_fn instead of softmax to
+  construct its attention distributions.  Since the attention scores are passed
+  through a sigmoid, a learnable scalar bias parameter is applied after the
+  score function and before the sigmoid.  Otherwise, it is equivalent to
+  BahdanauAttention.  This approach is proposed in
+  Colin Raffel, Minh-Thang Luong, Peter J. Liu, Ron J. Weiss, Douglas Eck,
+  "Online and Linear-Time Attention by Enforcing Monotonic Alignments."
+  ICML 2017.  https://arxiv.org/abs/1704.00784
+  """
+
+  def __init__(self,
+               num_units,
+               memory,
+               memory_sequence_length=None,
+               normalize=False,
+               score_mask_value=None,
+               sigmoid_noise=0.,
+               sigmoid_noise_seed=None,
+               score_bias_init=0.,
+               mode="parallel",
+               dtype=None,
+               name="BahdanauMonotonicAttention"):
+    """Construct the Attention mechanism.
+    Args:
+      num_units: The depth of the query mechanism.
+      memory: The memory to query; usually the output of an RNN encoder.  This
+        tensor should be shaped `[batch_size, max_time, ...]`.
+      memory_sequence_length (optional): Sequence lengths for the batch entries
+        in memory.  If provided, the memory tensor rows are masked with zeros
+        for values past the respective sequence lengths.
+      normalize: Python boolean.  Whether to normalize the energy term.
+      score_mask_value: (optional): The mask value for score before passing into
+        `probability_fn`. The default is -inf. Only used if
+        `memory_sequence_length` is not None.
+      sigmoid_noise: Standard deviation of pre-sigmoid noise.  See the docstring
+        for `_monotonic_probability_fn` for more information.
+      sigmoid_noise_seed: (optional) Random seed for pre-sigmoid noise.
+      score_bias_init: Initial value for score bias scalar.  It's recommended to
+        initialize this to a negative value when the length of the memory is
+        large.
+      mode: How to compute the attention distribution.  Must be one of
+        'recursive', 'parallel', or 'hard'.  See the docstring for
+        `tf.contrib.seq2seq.monotonic_attention` for more information.
+      dtype: The data type for the query and memory layers of the attention
+        mechanism.
+      name: Name to use when creating ops.
+    """
+    # Set up the monotonic probability fn with supplied parameters
+    if dtype is None:
+      dtype = dtypes.float32
+    wrapped_probability_fn = functools.partial(
+        _monotonic_probability_fn, sigmoid_noise=sigmoid_noise, mode=mode,
+        seed=sigmoid_noise_seed)
+    super(BahdanauMonotonicAttention, self).__init__(
+        query_layer=layers_core.Dense(
+            num_units, name="query_layer", use_bias=False, dtype=dtype),
+        memory_layer=layers_core.Dense(
+            num_units, name="memory_layer", use_bias=False, dtype=dtype),
+        memory=memory,
+        probability_fn=wrapped_probability_fn,
+        memory_sequence_length=memory_sequence_length,
+        score_mask_value=score_mask_value,
+        name=name)
+    self._num_units = num_units
+    self._normalize = normalize
+    self._name = name
+    self._score_bias_init = score_bias_init
+
+  def __call__(self, query, state):
+    """Score the query based on the keys and values.
+    Args:
+      query: Tensor of dtype matching `self.values` and shape
+        `[batch_size, query_depth]`.
+      state: Tensor of dtype matching `self.values` and shape
+        `[batch_size, alignments_size]`
+        (`alignments_size` is memory's `max_time`).
+    Returns:
+      alignments: Tensor of dtype matching `self.values` and shape
+        `[batch_size, alignments_size]` (`alignments_size` is memory's
+        `max_time`).
+    """
+    with variable_scope.variable_scope(
+        None, "bahdanau_monotonic_attention", [query]):
+      processed_query = self.query_layer(query) if self.query_layer else query
+      score = _bahdanau_score(processed_query, self._keys, self._normalize)
+      score_bias = variable_scope.get_variable(
+          "attention_score_bias", dtype=processed_query.dtype,
+          initializer=self._score_bias_init)
+      score += score_bias
+    alignments = self._probability_fn(score, state)
+    next_state = alignments
+return alignments, next_state
+
+class LuongMonotonicAttention(_BaseMonotonicAttentionMechanism):
+  """Monotonic attention mechanism with Luong-style energy function.
+  This type of attention enforces a monotonic constraint on the attention
+  distributions; that is once the model attends to a given point in the memory
+  it can't attend to any prior points at subsequence output timesteps.  It
+  achieves this by using the _monotonic_probability_fn instead of softmax to
+  construct its attention distributions.  Otherwise, it is equivalent to
+  LuongAttention.  This approach is proposed in
+  Colin Raffel, Minh-Thang Luong, Peter J. Liu, Ron J. Weiss, Douglas Eck,
+  "Online and Linear-Time Attention by Enforcing Monotonic Alignments."
+  ICML 2017.  https://arxiv.org/abs/1704.00784
+  """
+
+  def __init__(self,
+               num_units,
+               memory,
+               memory_sequence_length=None,
+               scale=False,
+               score_mask_value=None,
+               sigmoid_noise=0.,
+               sigmoid_noise_seed=None,
+               score_bias_init=0.,
+               mode="parallel",
+               dtype=None,
+               name="LuongMonotonicAttention"):
+    """Construct the Attention mechanism.
+    Args:
+      num_units: The depth of the query mechanism.
+      memory: The memory to query; usually the output of an RNN encoder.  This
+        tensor should be shaped `[batch_size, max_time, ...]`.
+      memory_sequence_length (optional): Sequence lengths for the batch entries
+        in memory.  If provided, the memory tensor rows are masked with zeros
+        for values past the respective sequence lengths.
+      scale: Python boolean.  Whether to scale the energy term.
+      score_mask_value: (optional): The mask value for score before passing into
+        `probability_fn`. The default is -inf. Only used if
+        `memory_sequence_length` is not None.
+      sigmoid_noise: Standard deviation of pre-sigmoid noise.  See the docstring
+        for `_monotonic_probability_fn` for more information.
+      sigmoid_noise_seed: (optional) Random seed for pre-sigmoid noise.
+      score_bias_init: Initial value for score bias scalar.  It's recommended to
+        initialize this to a negative value when the length of the memory is
+        large.
+      mode: How to compute the attention distribution.  Must be one of
+        'recursive', 'parallel', or 'hard'.  See the docstring for
+        `tf.contrib.seq2seq.monotonic_attention` for more information.
+      dtype: The data type for the query and memory layers of the attention
+        mechanism.
+      name: Name to use when creating ops.
+    """
+    # Set up the monotonic probability fn with supplied parameters
+    if dtype is None:
+      dtype = dtypes.float32
+    wrapped_probability_fn = functools.partial(
+        _monotonic_probability_fn, sigmoid_noise=sigmoid_noise, mode=mode,
+        seed=sigmoid_noise_seed)
+    super(LuongMonotonicAttention, self).__init__(
+        query_layer=None,
+        memory_layer=layers_core.Dense(
+            num_units, name="memory_layer", use_bias=False, dtype=dtype),
+        memory=memory,
+        probability_fn=wrapped_probability_fn,
+        memory_sequence_length=memory_sequence_length,
+        score_mask_value=score_mask_value,
+        name=name)
+    self._num_units = num_units
+    self._scale = scale
+    self._score_bias_init = score_bias_init
+    self._name = name
+
+  def __call__(self, query, state):
+    """Score the query based on the keys and values.
+    Args:
+      query: Tensor of dtype matching `self.values` and shape
+        `[batch_size, query_depth]`.
+      state: Tensor of dtype matching `self.values` and shape
+        `[batch_size, alignments_size]`
+        (`alignments_size` is memory's `max_time`).
+    Returns:
+      alignments: Tensor of dtype matching `self.values` and shape
+        `[batch_size, alignments_size]` (`alignments_size` is memory's
+        `max_time`).
+    """
+    with variable_scope.variable_scope(None, "luong_monotonic_attention",
+                                       [query]):
+      score = _luong_score(query, self._keys, self._scale)
+      score_bias = variable_scope.get_variable(
+          "attention_score_bias", dtype=query.dtype,
+          initializer=self._score_bias_init)
+      score += score_bias
+    alignments = self._probability_fn(score, state)
+    next_state = alignments
+return alignments, next_state
+
+class AttentionWrapperState(
+    collections.namedtuple("AttentionWrapperState",
+                           ("cell_state", "attention", "time", "alignments",
+                            "alignment_history", "attention_state"))):
+  """`namedtuple` storing the state of a `AttentionWrapper`.
+  Contains:
+    - `cell_state`: The state of the wrapped `RNNCell` at the previous time
+      step.
+    - `attention`: The attention emitted at the previous time step.
+    - `time`: int32 scalar containing the current time step.
+    - `alignments`: A single or tuple of `Tensor`(s) containing the alignments
+       emitted at the previous time step for each attention mechanism.
+    - `alignment_history`: (if enabled) a single or tuple of `TensorArray`(s)
+       containing alignment matrices from all time steps for each attention
+       mechanism. Call `stack()` on each to convert to a `Tensor`.
+    - `attention_state`: A single or tuple of nested objects
+       containing attention mechanism state for each attention mechanism.
+       The objects may contain Tensors or TensorArrays.
+  """
+
+  def clone(self, **kwargs):
+    """Clone this object, overriding components provided by kwargs.
+    The new state fields' shape must match original state fields' shape. This
+    will be validated, and original fields' shape will be propagated to new
+    fields.
+    Example:
+    ```python
+    initial_state = attention_wrapper.zero_state(dtype=..., batch_size=...)
+    initial_state = initial_state.clone(cell_state=encoder_state)
+    ```
+    Args:
+      **kwargs: Any properties of the state object to replace in the returned
+        `AttentionWrapperState`.
+    Returns:
+      A new `AttentionWrapperState` whose properties are the same as
+      this one, except any overridden properties as provided in `kwargs`.
+    """
+    def with_same_shape(old, new):
+      """Check and set new tensor's shape."""
+      if isinstance(old, ops.Tensor) and isinstance(new, ops.Tensor):
+        return tensor_util.with_same_shape(old, new)
+      return new
+
+    return nest.map_structure(
+        with_same_shape,
+        self,
+super(AttentionWrapperState, self)._replace(**kwargs)
