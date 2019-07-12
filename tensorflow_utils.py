@@ -3,6 +3,7 @@
 ====================================================================
 1.array_ops.slice：在指定起点（begin）截取指定大小的张量，size指在每一个维度上
 分别截取的长度。
+2. array_ops.stop_gradient：源码未找到，用于停止对于变量input的梯度计算。
 """
 def slice(input_, begin, size, name=None):
   # pylint: disable=redefined-builtin
@@ -40,3 +41,5 @@ def slice(input_, begin, size, name=None):
     A `Tensor` the same type as `input`.
   """
   return gen_array_ops._slice(input_, begin, size, name=name)
+
+
