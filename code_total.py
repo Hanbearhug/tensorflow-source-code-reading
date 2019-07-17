@@ -10,6 +10,9 @@
 而层次softmax的时间复杂度是O（logN），但是负采样单次训练复杂度是O（1）（好吧我不想承认其实是因为我懒。。。写完这俩再写个load和save感觉要突破500
 行了。。感觉自己写了个库出来。。以后有时间再说吧，另有任何不懂的或者改进的地方欢迎和本菜鸡讨论）
 
+2019-07-16:更新AFM模型，加入attention机制（原论文中有源代码实现，我仅仅是练手，要用原汁原味的请去原论文查找。。），发现原论文居然用的是for循环
+写出来的。。。估计比我的更慢，好处是应该不会那么吃内存。然而牺牲了效率使得模型复杂度为O(p^2)后果是模型巨慢，谁用谁知道。。。
+
 注：后续会复现LINE、Node2Vec、GraRep等图嵌入模型，什么时候写看我什么时候想起来。。。。
 """
 
@@ -441,3 +444,256 @@ class app2vec:
         most_k = np.argsort(cos_similarity)[-k:]
         most_similar_word = [self.index2word[i] for i in most_k]
         return most_similar_word
+
+class AFM:
+    def __init__(self, field_size, feature_size, attention_hidden_size, embedding_size=50,
+                 learning_rate=0.01):
+        self.feature_size = feature_size # denote as M, size of the feature dictionary
+        self.field_size = field_size # denote as F, size of the feature fields
+        self.embedding_size = embedding_size # denote as K, size of the feature embedding
+        self.attention_hidden_size = attention_hidden_size
+        self.learning_rate = learning_rate
+        self._init_graph()
+
+    def _init_weight(self):
+        weights = {}
+        weights['embedding'] = tf.Variable(
+            tf.truncated_normal([self.feature_size, self.embedding_size], 0, 0.01),
+            name='embedding'
+        )
+        weights['feature_bias'] = tf.Variable(
+            tf.truncated_normal([self.feature_size, 1], 0, 0.01),
+            name='feature_bias'
+        )
+        weights['bias'] = tf.Variable(
+            tf.truncated_normal([1], 0, 0.01),
+            name='bias'
+        )
+        weights['attention_w'] = tf.Variable(
+            tf.truncated_normal([self.embedding_size, self.attention_hidden_size], 0, 0.01),
+            name='attention_w'
+        )
+        weights['attention_b'] = tf.Variable(
+            tf.truncated_normal([1, self.attention_hidden_size], 0, 0.01),
+            name='attention_b'
+        )
+        weights['attention_h'] = tf.Variable(
+            tf.truncated_normal([self.attention_hidden_size, 1], 0, 0.01),
+            name='attention_h'
+        )
+        weights['projection_attention'] = tf.Variable(
+            tf.truncated_normal([self.embedding_size, 1], 0, 0.01),
+            name='projection_attention'
+        )
+        return weights
+
+    def _init_graph(self):
+        tf.reset_default_graph()
+        self.feature_index = tf.placeholder(tf.int32, [None, self.field_size], name='feature_index')
+        self.feature_value = tf.placeholder(tf.float32, [None, self.field_size], name='feature_value')
+        self.train_labels = tf.placeholder(tf.int32, [None, 1], name='train_labels')
+        self.weights = self._init_weight()
+        """
+        =============================================================================================
+        一次项计算
+        """
+        self.first_order_embedding = tf.nn.embedding_lookup(
+            self.weights['feature_bias'],
+            self.feature_index,
+            name='first_order_embedding'
+        ) # [batch_size, F, 1]
+        self.first_order = tf.reshape(
+            tf.reduce_sum(
+                tf.multiply(
+                    self.first_order_embedding,
+                    tf.expand_dims(
+                        self.feature_value,
+                        -1
+                    )
+                ),
+                axis=1
+            ),
+            shape=[-1,1],
+            name='first_order'
+        ) # [batch_size, 1]
+
+        """
+        =============================================================================================
+        二次项计算，包括attention pool层的计算
+        """
+
+        self.feature_embedding = tf.nn.embedding_lookup(
+            self.weights['embedding'],
+            self.feature_index,
+            name='feature_embedding'
+        )
+        self.feature_embedding_multi_value = tf.multiply(
+            self.feature_embedding,
+            tf.expand_dims(
+                self.feature_value,
+                axis=-1
+            ),
+            name='feature_embedding_multi_value'
+        ) # [batch_size, feature_size, embedding_size]
+
+        self.feature_embedding_multi_value_expand_dim = tf.expand_dims(
+            tf.transpose(self.feature_embedding_multi_value, perm=[0,2,1]),
+            axis=-1,
+            name='feature_embedding_multi_value_expand_dim'
+        ) # [batch_size, embedding_size, feature_size, 1]
+
+        self.pair_wise_interaction = tf.subtract(
+            tf.linalg.band_part(
+                tf.matmul(
+                    self.feature_embedding_multi_value_expand_dim,
+                    tf.transpose(self.feature_embedding_multi_value_expand_dim, perm=[0, 1, 3, 2])
+                ),
+                num_lower=0,
+                num_upper=-1,
+            ),
+            tf.linalg.band_part(
+                tf.matmul(
+                    self.feature_embedding_multi_value_expand_dim,
+                    tf.transpose(self.feature_embedding_multi_value_expand_dim, perm=[0, 1, 3, 2])
+                ),
+                num_lower=0,
+                num_upper=0,
+            ),
+            name='pair_wise_interaction'
+        )
+
+
+        upper_triangle_index = tf.where(
+            tf.subtract(
+                tf.linalg.band_part(
+                    tf.ones_like(self.pair_wise_interaction),
+                    num_lower=0,
+                    num_upper=-1,
+                ),
+                tf.linalg.band_part(
+                    tf.ones_like(self.pair_wise_interaction),
+                    num_lower=0,
+                    num_upper=0,
+                ),
+            )>0
+        )
+
+        self.pair_wise_interaction_flatten = tf.transpose(
+            tf.reshape(
+                tf.gather_nd(
+                    self.pair_wise_interaction,
+                    indices=upper_triangle_index,
+                    name='pair_wise_interaction_flatten'
+                ),
+                shape=[-1, self.embedding_size, int(self.field_size * (self.field_size - 1)/2)]
+            ),  # [batch_size, embedding_size, feature_size * (feature_size-1)]
+            perm=[0,2,1]
+        ) # [batch_size, feature_size * (feature_size-1), embedding_size]
+
+        self.attention_net = tf.reshape(
+            tf.matmul(
+                tf.nn.relu(
+                    tf.add(
+                        tf.matmul(
+                            tf.reshape(
+                                self.pair_wise_interaction_flatten,
+                                shape=(-1, self.embedding_size)
+                            ),
+                            self.weights['attention_w']
+                        ),
+                        self.weights['attention_b']
+                    ),
+                ),  # [batch_size, feature_size * (feature_size-1), attention_hidden_size]
+                self.weights['attention_h']
+            ),
+            shape=(-1, int(self.field_size * (self.field_size - 1)/2), 1)
+        ) # [batch_size, feature_size * (feature_size-1)/2, 1]
+
+        self.attention_pool = tf.reduce_sum(
+            tf.multiply(
+                self.pair_wise_interaction_flatten,
+                self.attention_net
+            ),
+            axis=1,
+            name='attention_pool'
+        ) # [batch_size, embedding_size]
+
+        self.second_order = tf.matmul(
+            self.attention_pool,
+            self.weights['projection_attention']
+        ) # [batch_size, 1]
+
+        self.bias = self.weights['bias'] * tf.ones((tf.shape(self.feature_index)[0],1), dtype=tf.float32) # [batch_size, 1]
+        self.y_hat = tf.nn.sigmoid(
+            tf.add_n([self.bias, self.first_order, self.second_order]),
+            name = 'y_hat'
+        ) # [batch_size, 1]
+
+        """
+        ======================================================================================
+        计算loss和反向传播
+        """
+        self.loss = tf.losses.log_loss(self.train_labels, self.y_hat, epsilon=1e-12)
+        self.train_op = tf.train.GradientDescentOptimizer(learning_rate=self.learning_rate).minimize(self.loss)
+
+        self.sess = tf.Session()
+        init = tf.global_variables_initializer()
+        self.sess.run(init)
+
+    def batcher(self, feature_index, feature_value, y=None, batch_size=64, is_train=True):
+        step = int(len(feature_index) / batch_size)
+        if is_train:
+            for i in range(step + 1):
+                try:
+                    feature_index_batch = feature_index[i * batch_size:(i + 1) * batch_size, :]
+                    feature_value_batch = feature_value[i * batch_size:(i + 1) * batch_size, :]
+                    y_batch = y[i * batch_size:(i + 1) * batch_size]
+
+                    yield feature_index_batch, feature_value_batch, y_batch
+                except:
+                    feature_index_batch = feature_index[i * batch_size:, :]
+                    feature_value_batch = feature_value[i * batch_size:, :]
+                    y_batch = y[i * batch_size:]
+
+                    yield feature_index_batch, feature_value_batch, y_batch
+        else:
+            for i in range(step + 1):
+                try:
+                    feature_index_batch = feature_index[i * batch_size:(i + 1) * batch_size, :]
+                    feature_value_batch = feature_value[i * batch_size:(i + 1) * batch_size, :]
+
+                    yield feature_index_batch, feature_value_batch
+                except:
+                    feature_index_batch = feature_index[i * batch_size:, :]
+                    feature_value_batch = feature_value[i * batch_size:, :]
+
+                    yield feature_index_batch, feature_value_batch
+
+    def fit_on_batch(self, feature_index_batch, feature_value_batch, y_batch):
+        feed_dict = {
+            self.feature_index: feature_index_batch,
+            self.feature_value: feature_value_batch,
+            self.train_labels: y_batch.reshape((-1,1))
+        }
+        loss, _ = self.sess.run([self.loss, self.train_op], feed_dict=feed_dict)
+        return loss
+
+    def fit(self, feature_index, feature_value, y, epochs=50, batch_size=64):
+        steps = int(feature_index.shape[0] / batch_size) + 1
+        for epoch in range(epochs):
+            perm = np.random.permutation(feature_index.shape[0])
+            total_loss = []
+            for feature_index_batch, feature_value_batch, y_batch in tqdm_notebook(self.batcher(feature_index[perm], feature_value[perm], y[perm], batch_size), total=steps,
+                                                  postfix=f'epoch: {epoch}', leave=False):
+                total_loss.append(self.fit_on_batch(feature_index_batch, feature_value_batch, y_batch))
+            print(f'epoch:{epoch} loss: {np.mean(total_loss)}')
+
+    def predict(self, feature_index, feature_value, batch_size=256):
+        y = np.array([])
+        for feature_index_batch, feature_value_batch in self.batcher(feature_index, feature_value, is_train=False, batch_size=batch_size):
+            y_pred = self.sess.run(self.y_hat, feed_dict={self.feature_index: feature_index_batch, self.feature_value: feature_value_batch})
+            if len(y) == 0:
+                y = y_pred
+            else:
+                y = np.vstack([y, y_pred])
+        return y
