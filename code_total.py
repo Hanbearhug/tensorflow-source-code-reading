@@ -13,6 +13,9 @@
 2019-07-16:更新AFM模型，加入attention机制（原论文中有源代码实现，我仅仅是练手，要用原汁原味的请去原论文查找。。），发现原论文居然用的是for循环
 写出来的。。。估计比我的更慢，好处是应该不会那么吃内存。然而牺牲了效率使得模型复杂度为O(p^2)后果是模型巨慢，谁用谁知道。。。
 
+2019-07-29：更新GCN半监督的图卷积神经网络，本质上是信息流在网络（社交网络等）基于拉普拉斯矩阵的传播过程，似乎也可以使用谱分析解释，然而这个待研究。。
+支持非监督学习和半监督学习两种方式，半监督需要传入一个mask矩阵指明哪些是有标签节点。
+
 注：后续会复现LINE、Node2Vec、GraRep等图嵌入模型，什么时候写看我什么时候想起来。。。。
 """
 
@@ -697,3 +700,102 @@ class AFM:
             else:
                 y = np.vstack([y, y_pred])
         return y
+class GCN:
+    def __init__(self, D, A, y_true, mask_label, hidden_size=30, embedding_size=30, output_size=2, is_supervised=False):
+        self.D = D
+        self.A = A
+        self.H = None
+        self.y_true = y_true
+        self.mask_label = mask_label
+        self.is_supervised = is_supervised
+        self.hidden_size = hidden_size
+        self.embedding_size = embedding_size
+        self.output_size = output_size
+        self.preprocess()
+        self._init_graph()
+
+    def _init_graph(self):
+        """
+        初始化图，可定义图卷积层数
+        :return:
+        """
+        self.y = tf.placeholder(shape=[None,1], name='y')
+        self.mask = tf.placeholder(shape=[None, 1], name='mask')
+        self.mask_norm = tf.div(self.mask, tf.reduce_mean(mask), name='mask_norm')
+        self.A_bar_tensor = tf.constant(self.A_bar, name='A_bar_tensor')
+        self.weight = self._init_weight()
+        """
+        ===========================================================================
+        构建图卷积
+        """
+        if self.is_supervised:
+            self.first_layer = tf.nn.relu(
+                tf.matmul(
+                    tf.matmul(self.A_bar_tensor, self.weight['embedding']),
+                    self.weight['w0']
+                ),
+                name='first_layer'
+            )
+            self.second_layer = tf.matmul(
+                tf.matmul(
+                    self.A_bar_tensor,
+                    self.first_layer
+                ),
+                self.weight['w1'],
+                name='second_layer'
+            )
+            self.loss_pre_mask = tf.losses.sparse_softmax_cross_entropy(
+                labels=self.y, logits=self.second_layer, name='loss_pre_mask'
+            )
+            self.loss_mask = tf.multiply(
+                self.loss_pre_mask, self.mask_norm, name='loss_mask'
+            )
+            self.loss = tf.reduce_mean(self.loss_mask, name='loss')
+            self.train_op = tf.train.GradientDescentOptimizer(learning_rate=0.01).minimize(self.loss)
+
+        else:
+            self.first_layer = tf.nn.relu(
+                tf.matmul(self.A_bar_tensor, self.weight['embedding']),
+                name='first_layer'
+            )
+            self.second_layer = tf.nn.relu(
+                tf.matmul(self.A_bar_tensor, self.first_layer),
+                name='second_layer'
+            )
+            self.third_layer = tf.nn.relu(
+                tf.matmul(self.A_bar_tensor, self.first_layer),
+                name='third_layer'
+            )
+        init = tf.global_variables_initializer()
+        self.sess = tf.Session()
+        self.sess.run(init)
+
+    def _init_weight(self):
+        weights = {}
+        weights['embedding'] = tf.Variable(
+            tf.truncated_normal(shape=(self.A.shape[0], self.embedding_size), mean=0, stddev=0.1),
+            name='embedding',
+        )
+        weights['w0'] = tf.Variable(
+            tf.truncated_normal(shape=(self.embedding_size, self.hidden_size),mean=0,stddev=0.1),
+            name='w0'
+        )
+        weights['w1'] = tf.Variable(
+            tf.truncated_normal(shape=(self.hidden_size, self.output_size), mean=0, stddev=0.1),
+            name='w1'
+        )
+    def fit(self, epochs):
+        for epoch in tqdm_notebook(range(epochs)):
+            feed_dict = {
+                self.y: self.y_true,
+                self.mask: self.mask_label
+            }
+            loss, _ = self.sess.run(
+                [self.loss, self.train_op],
+                feed_dict=feed_dict
+            )
+            print(f'epoch{epoch}: loss:{loss}')
+    def preprocess(self):
+        self.A_tuta = self.A + np.identity(self.A.shape[0])
+        self.D_tuta = np.diagflat(self.A_tuta.sum(axis=1))
+        self.A_bar = np.dot(np.power(self.D_tuta, -0.5), self.A_tuta).dot(np.power(self.D_tuta, -0.5))
